@@ -3,13 +3,38 @@ use std::net::{UdpSocket, IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
 use std::thread;
+use std::sync::{Arc, Mutex, mpsc};
 
-// Функция для проверки одного конкретного UDP-порта
+// Подключаем специфичные для Windows расширения сетевого стека
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
+
+// Константа SIO_UDP_CONNRESET для Windows (значение из заголовочных файлов Windows SDK)
+#[cfg(target_os = "windows")]
+const SIO_UDP_CONNRESET: u32 = 0x9800000C;
+
 fn scan_udp_port(ip: IpAddr, port: u16) -> bool {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return false,
     };
+
+    // --- Исправленный блок ioctl для Windows ---
+    #[cfg(target_os = "windows")]
+    {
+        // Используем встроенные в Rust системные вызовы для Windows
+        extern "system" {
+            fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
+        }
+
+        let raw_socket = socket.as_raw_socket() as usize;
+        let mut flag: u32 = 1; // 1 = включить сброс при ошибке, 0 = выключить
+        
+        unsafe {
+            // Вызываем системную функцию ioctlsocket напрямую
+            ioctlsocket(raw_socket, SIO_UDP_CONNRESET as i32, &mut flag);
+        }
+    }
 
     if socket.set_read_timeout(Some(Duration::from_secs(1))).is_err() {
         return false;
@@ -26,15 +51,14 @@ fn scan_udp_port(ip: IpAddr, port: u16) -> bool {
 
     let mut buf = [0; 1];
     match socket.recv(&mut buf) {
-        // Ошибка означает, что получен ICMP-ответ "Port Unreachable" -> порт закрыт
         Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused || 
                       e.kind() == std::io::ErrorKind::ConnectionReset => {
             false
         }
-        // Во всех остальных случаях (таймаут или данные) порт считается открытым/фильтруемым
         _ => true,
     }
 }
+
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -42,7 +66,6 @@ fn main() {
 
     if args.len() < 2 {
         println!("Внимание: IP-адрес не указан. Используется локальный 127.0.0.1");
-        println!("Пример для сканирования внешнего IP: cargo run -- 8.8.8.8\n");
         target_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     } else {
         target_ip = match IpAddr::from_str(&args[1]) {
@@ -54,19 +77,53 @@ fn main() {
         };
     }
 
-    // Диапазон портов для сканирования
-    let ports_to_scan: Vec<u16> = (1..150).collect();
+    let ports_to_scan: Vec<u16> = (1..30000).collect();
+    let total_ports = ports_to_scan.len();
 
-    println!("Запуск UDP-сканирования для узла {}...\n", target_ip);
+    let ports_queue = Arc::new(Mutex::new(ports_to_scan));
+    let (tx, rx) = mpsc::channel();
 
-    for port in ports_to_scan {
-        if scan_udp_port(target_ip, port) {
-            println!("[+] Порт {} [UDP] открыт / фильтруется", port);
-        }
-        
-        // Пауза, чтобы сетевой стек не захлебывался
-        thread::sleep(Duration::from_millis(15));
+    // Оптимальный баланс скорости и точности для Windows после исправления сокета
+    let num_threads = 6; 
+    let mut thread_handles = Vec::new();
+
+    println!("Запуск Windows-оптимизированного сканирования для {}...", target_ip);
+    println!("Потоков: {}, Ожидайте результаты...\n", num_threads);
+
+    for _ in 0..num_threads {
+        let ports = Arc::clone(&ports_queue);
+        let tx_clone = tx.clone();
+
+        let handle = thread::spawn(move || {
+            loop {
+                let port = {
+                    let mut queue = ports.lock().unwrap();
+                    if queue.is_empty() {
+                        break;
+                    }
+                    queue.remove(0)
+                };
+
+                if scan_udp_port(target_ip, port) {
+                    let _ = tx_clone.send(port);
+                }
+
+                // Небольшая задержка, чтобы ОС успевала обрабатывать буферы прерываний
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+        thread_handles.push(handle);
     }
 
-    println!("\nСканирование успешно завершено.");
+    drop(tx);
+
+    for open_port in rx {
+        println!("[+] Порт {} [UDP] открыт / фильтруется", open_port);
+    }
+
+    for handle in thread_handles {
+        let _ = handle.join();
+    }
+
+    println!("\nСканирование всех {} портов успешно завершено.", total_ports);
 }
