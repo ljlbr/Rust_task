@@ -5,11 +5,9 @@ use std::time::Duration;
 use std::thread;
 use std::sync::{Arc, Mutex, mpsc};
 
-// Подключаем специфичные для Windows расширения сетевого стека
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawSocket;
 
-// Константа SIO_UDP_CONNRESET для Windows (значение из заголовочных файлов Windows SDK)
 #[cfg(target_os = "windows")]
 const SIO_UDP_CONNRESET: u32 = 0x9800000C;
 
@@ -19,10 +17,9 @@ fn scan_udp_port(ip: IpAddr, port: u16) -> bool {
         Err(_) => return false,
     };
 
-    // --- Исправленный блок ioctl для Windows ---
     #[cfg(target_os = "windows")]
     {
-        // Используем встроенные в Rust системные вызовы для Windows
+
         extern "system" {
             fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
         }
@@ -31,7 +28,6 @@ fn scan_udp_port(ip: IpAddr, port: u16) -> bool {
         let mut flag: u32 = 1; // 1 = включить сброс при ошибке, 0 = выключить
         
         unsafe {
-            // Вызываем системную функцию ioctlsocket напрямую
             ioctlsocket(raw_socket, SIO_UDP_CONNRESET as i32, &mut flag);
         }
     }
